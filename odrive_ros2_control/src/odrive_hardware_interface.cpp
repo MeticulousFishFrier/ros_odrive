@@ -1,14 +1,29 @@
 
 #include "can_helpers.hpp"
 #include "can_simple_messages.hpp"
+#include "hardware_interface/lexical_casts.hpp"
 #include "hardware_interface/system_interface.hpp"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "odrive_enums.h"
 #include "pluginlib/class_list_macros.hpp"
+#include "rclcpp/clock.hpp"
+#include "rclcpp/logging.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "socket_can.hpp"
+#include "transmission_interface/simple_transmission_loader.hpp"
+#include "transmission_interface/transmission.hpp"
+#include "transmission_interface/transmission_interface_exception.hpp"
+
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <numeric>
+#include <sstream>
+#include <vector>
 
 namespace odrive_ros2_control {
+constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 
 class Axis;
 
@@ -42,6 +57,46 @@ private:
     std::string can_intf_name_;
     SocketCanIntf can_intf_;
     rclcpp::Time timestamp_;
+
+    std::unique_ptr<rclcpp::Logger> logger_;
+    std::unique_ptr<rclcpp::Clock> clock_;
+
+    // transmissions
+    std::vector<std::shared_ptr<transmission_interface::Transmission>> transmissions_;
+
+    struct InterfaceData {
+        // Constructor initializing all members
+        explicit InterfaceData(const std::string& name)
+            : name_(name),
+              command_position_(0.0),
+              state_position_(0.0),
+              command_velocity_(0.0),
+              state_velocity_(0.0),
+              command_effort_(0.0),
+              state_effort_(0.0),
+              transmission_passthrough_position_(0.0),
+              transmission_passthrough_velocity_(0.0),
+              transmission_passthrough_effort_(0.0) {}
+        std::string name_;
+
+        // Command and state for position, velocity, and effort
+        double command_position_;
+        double state_position_;
+
+        double command_velocity_;
+        double state_velocity_;
+
+        double command_effort_;
+        double state_effort_;
+
+        // Transmission passthroughs for each interface
+        double transmission_passthrough_position_;
+        double transmission_passthrough_velocity_;
+        double transmission_passthrough_effort_;
+    };
+
+    std::vector<InterfaceData> joint_interfaces_;
+    std::vector<InterfaceData> actuator_interfaces_;
 };
 
 struct Axis {
@@ -116,14 +171,164 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
         axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")));
     }
 
+    logger_ = std::make_unique<rclcpp::Logger>(rclcpp::get_logger("ODriveHardwareInterface"));
+
+    clock_ = std::make_unique<rclcpp::Clock>();
+
+    const auto num_joints = std::accumulate(
+        info_.transmissions.begin(),
+        info_.transmissions.end(),
+        0ul,
+        [](const auto& acc, const auto& trans_info) { return acc + trans_info.joints.size(); }
+    );
+
+    const auto num_actuators = std::accumulate(
+        info_.transmissions.begin(),
+        info_.transmissions.end(),
+        0ul,
+        [](const auto& acc, const auto& trans_info) { return acc + trans_info.actuators.size(); }
+    );
+
+    // reserve the space needed for joint and actuator data structures
+    joint_interfaces_.reserve(num_joints);
+    actuator_interfaces_.reserve(num_actuators);
+
+    // create transmissions, joint, and actuator handles
+    auto transmission_loader = transmission_interface::SimpleTransmissionLoader();
+
+    for (const auto& transmission_info : info_.transmissions) {
+        // only simple transmissions are supported in this demo
+        if (transmission_info.type != "transmission_interface/SimpleTransmission") {
+            RCLCPP_FATAL(
+                *logger_,
+                "Transmission '%s' of type '%s' not supported in this demo",
+                transmission_info.name.c_str(),
+                transmission_info.type.c_str()
+            );
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+
+        std::shared_ptr<transmission_interface::Transmission> transmission;
+        try {
+            transmission = transmission_loader.load(transmission_info);
+        } catch (const transmission_interface::TransmissionInterfaceException& exc) {
+            RCLCPP_FATAL(*logger_, "Error while loading %s: %s", transmission_info.name.c_str(), exc.what());
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+
+        std::vector<transmission_interface::JointHandle> joint_handles;
+        for (const auto& joint_info : transmission_info.joints) {
+            // Insert joint interface data
+            const auto joint_interface = joint_interfaces_.insert(
+                joint_interfaces_.end(),
+                InterfaceData(joint_info.name)
+            );
+
+            // Create joint handles for position, velocity, and effort
+            transmission_interface::JointHandle position_handle(
+                joint_info.name,
+                hardware_interface::HW_IF_POSITION,
+                &joint_interface->transmission_passthrough_position_
+            );
+            joint_handles.push_back(position_handle);
+
+            transmission_interface::JointHandle velocity_handle(
+                joint_info.name,
+                hardware_interface::HW_IF_VELOCITY,
+                &joint_interface->transmission_passthrough_velocity_
+            );
+            joint_handles.push_back(velocity_handle);
+
+            transmission_interface::JointHandle effort_handle(
+                joint_info.name,
+                hardware_interface::HW_IF_EFFORT,
+                &joint_interface->transmission_passthrough_effort_
+            );
+            joint_handles.push_back(effort_handle);
+        }
+
+        std::vector<transmission_interface::ActuatorHandle> actuator_handles;
+        for (const auto& actuator_info : transmission_info.actuators) {
+            // Insert actuator interface data
+            const auto actuator_interface = actuator_interfaces_.insert(
+                actuator_interfaces_.end(),
+                InterfaceData(actuator_info.name)
+            );
+
+            // Create actuator handles for position, velocity, and effort
+            transmission_interface::ActuatorHandle position_handle(
+                actuator_info.name,
+                hardware_interface::HW_IF_POSITION,
+                &actuator_interface->transmission_passthrough_position_
+            );
+            actuator_handles.push_back(position_handle);
+
+            transmission_interface::ActuatorHandle velocity_handle(
+                actuator_info.name,
+                hardware_interface::HW_IF_VELOCITY,
+                &actuator_interface->transmission_passthrough_velocity_
+            );
+            actuator_handles.push_back(velocity_handle);
+
+            transmission_interface::ActuatorHandle effort_handle(
+                actuator_info.name,
+                hardware_interface::HW_IF_EFFORT,
+                &actuator_interface->transmission_passthrough_effort_
+            );
+            actuator_handles.push_back(effort_handle);
+        }
+
+        /// @note no need to store the joint and actuator handles, the transmission
+        /// will keep whatever info it needs after it is done with them
+
+        try {
+            transmission->configure(joint_handles, actuator_handles);
+        } catch (const transmission_interface::TransmissionInterfaceException& exc) {
+            RCLCPP_FATAL(*logger_, "Error while configuring %s: %s", transmission_info.name.c_str(), exc.what());
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+
+        transmissions_.push_back(transmission);
+
+        RCLCPP_INFO(*logger_, "Initialization successful");
+    }
     return CallbackReturn::SUCCESS;
 }
 
 CallbackReturn ODriveHardwareInterface::on_configure(const State&) {
     if (!can_intf_.init(can_intf_name_, &event_loop_, std::bind(&ODriveHardwareInterface::on_can_msg, this, _1))) {
-        RCLCPP_ERROR(rclcpp::get_logger("ODriveHardwareInterface"), "Failed to initialize SocketCAN on %s", can_intf_name_.c_str());
+        RCLCPP_ERROR(
+            rclcpp::get_logger("ODriveHardwareInterface"),
+            "Failed to initialize SocketCAN on %s",
+            can_intf_name_.c_str()
+        );
         return CallbackReturn::ERROR;
     }
+
+    RCLCPP_INFO(*logger_, "Configuring...");
+
+    auto reset_interfaces = [](std::vector<InterfaceData>& interfaces) {
+        for (auto& interface_data : interfaces) {
+            // Reset command values
+            interface_data.command_position_ = 0.0;
+            interface_data.command_velocity_ = 0.0;
+            interface_data.command_effort_ = 0.0;
+
+            // Reset state values
+            interface_data.state_position_ = 0.0;
+            interface_data.state_velocity_ = 0.0;
+            interface_data.state_effort_ = 0.0;
+
+            // Reset transmission passthrough
+            interface_data.transmission_passthrough_position_ = kNaN;
+            interface_data.transmission_passthrough_velocity_ = kNaN;
+            interface_data.transmission_passthrough_effort_ = kNaN;
+        }
+    };
+
+    reset_interfaces(joint_interfaces_);
+    reset_interfaces(actuator_interfaces_);
+
     RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Initialized SocketCAN on %s", can_intf_name_.c_str());
     return CallbackReturn::SUCCESS;
 }
@@ -156,22 +361,36 @@ CallbackReturn ODriveHardwareInterface::on_deactivate(const State&) {
 std::vector<hardware_interface::StateInterface> ODriveHardwareInterface::export_state_interfaces() {
     std::vector<hardware_interface::StateInterface> state_interfaces;
 
-    for (size_t i = 0; i < info_.joints.size(); i++) {
-        state_interfaces.emplace_back(hardware_interface::StateInterface(
-            info_.joints[i].name,
-            hardware_interface::HW_IF_EFFORT,
-            &axes_[i].torque_target_
-        ));
-        state_interfaces.emplace_back(hardware_interface::StateInterface(
-            info_.joints[i].name,
-            hardware_interface::HW_IF_VELOCITY,
-            &axes_[i].vel_estimate_
-        ));
-        state_interfaces.emplace_back(hardware_interface::StateInterface(
-            info_.joints[i].name,
-            hardware_interface::HW_IF_POSITION,
-            &axes_[i].pos_estimate_
-        ));
+    for (const auto& joint : info_.joints) {
+        // Find the joint interface
+        auto joint_interface = std::find_if(
+            joint_interfaces_.begin(),
+            joint_interfaces_.end(),
+            [&](const InterfaceData& interface) { return interface.name_ == joint.name; }
+        );
+
+        if (joint_interface != joint_interfaces_.end()) {
+            // Add position state interface
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                joint.name,
+                hardware_interface::HW_IF_POSITION,
+                &joint_interface->state_position_
+            ));
+
+            // Add velocity state interface
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                joint.name,
+                hardware_interface::HW_IF_VELOCITY,
+                &joint_interface->state_velocity_
+            ));
+
+            // Add effort state interface
+            state_interfaces.emplace_back(hardware_interface::StateInterface(
+                joint.name,
+                hardware_interface::HW_IF_EFFORT,
+                &joint_interface->state_effort_
+            ));
+        }
     }
 
     return state_interfaces;
@@ -180,22 +399,36 @@ std::vector<hardware_interface::StateInterface> ODriveHardwareInterface::export_
 std::vector<hardware_interface::CommandInterface> ODriveHardwareInterface::export_command_interfaces() {
     std::vector<hardware_interface::CommandInterface> command_interfaces;
 
-    for (size_t i = 0; i < info_.joints.size(); i++) {
-        command_interfaces.emplace_back(hardware_interface::CommandInterface(
-            info_.joints[i].name,
-            hardware_interface::HW_IF_EFFORT,
-            &axes_[i].torque_setpoint_
-        ));
-        command_interfaces.emplace_back(hardware_interface::CommandInterface(
-            info_.joints[i].name,
-            hardware_interface::HW_IF_VELOCITY,
-            &axes_[i].vel_setpoint_
-        ));
-        command_interfaces.emplace_back(hardware_interface::CommandInterface(
-            info_.joints[i].name,
-            hardware_interface::HW_IF_POSITION,
-            &axes_[i].pos_setpoint_
-        ));
+    for (const auto& joint : info_.joints) {
+        // Find the joint interface
+        auto joint_interface = std::find_if(
+            joint_interfaces_.begin(),
+            joint_interfaces_.end(),
+            [&](const InterfaceData& interface) { return interface.name_ == joint.name; }
+        );
+
+        if (joint_interface != joint_interfaces_.end()) {
+            // Add position command interface
+            command_interfaces.emplace_back(hardware_interface::CommandInterface(
+                joint.name,
+                hardware_interface::HW_IF_POSITION,
+                &joint_interface->command_position_
+            ));
+
+            // Add velocity command interface
+            command_interfaces.emplace_back(hardware_interface::CommandInterface(
+                joint.name,
+                hardware_interface::HW_IF_VELOCITY,
+                &joint_interface->command_velocity_
+            ));
+
+            // Add effort command interface
+            command_interfaces.emplace_back(hardware_interface::CommandInterface(
+                joint.name,
+                hardware_interface::HW_IF_EFFORT,
+                &joint_interface->command_effort_
+            ));
+        }
     }
 
     return command_interfaces;
@@ -236,15 +469,27 @@ return_type ODriveHardwareInterface::perform_command_mode_switch(
         if (mode_switch) {
             Set_Controller_Mode_msg_t msg;
             if (axis.pos_input_enabled_) {
-                RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Setting %s to position control", info_.joints[i].name.c_str());
+                RCLCPP_INFO(
+                    rclcpp::get_logger("ODriveHardwareInterface"),
+                    "Setting %s to position control",
+                    info_.joints[i].name.c_str()
+                );
                 msg.Control_Mode = CONTROL_MODE_POSITION_CONTROL;
                 msg.Input_Mode = INPUT_MODE_PASSTHROUGH;
             } else if (axis.vel_input_enabled_) {
-                RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Setting %s to velocity control", info_.joints[i].name.c_str());
+                RCLCPP_INFO(
+                    rclcpp::get_logger("ODriveHardwareInterface"),
+                    "Setting %s to velocity control",
+                    info_.joints[i].name.c_str()
+                );
                 msg.Control_Mode = CONTROL_MODE_VELOCITY_CONTROL;
                 msg.Input_Mode = INPUT_MODE_PASSTHROUGH;
             } else {
-                RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Setting %s to torque control", info_.joints[i].name.c_str());
+                RCLCPP_INFO(
+                    rclcpp::get_logger("ODriveHardwareInterface"),
+                    "Setting %s to torque control",
+                    info_.joints[i].name.c_str()
+                );
                 msg.Control_Mode = CONTROL_MODE_TORQUE_CONTROL;
                 msg.Input_Mode = INPUT_MODE_PASSTHROUGH;
             }
@@ -277,16 +522,71 @@ return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const r
         // repeat until CAN interface has no more messages
     }
 
+    for (size_t i = 0; i < info_.joints.size(); i++) {
+        actuator_interfaces_[i].state_position_ = axes_[i].pos_estimate_;
+        actuator_interfaces_[i].state_velocity_ = axes_[i].vel_estimate_;
+        // BUG? state interface of odrive original code shows torque_target_ instead
+        actuator_interfaces_[i].state_effort_ = axes_[i].torque_estimate_;
+    }
+
+    // Actuator: state -> transmission
+    std::for_each(actuator_interfaces_.begin(), actuator_interfaces_.end(), [](auto& actuator_interface) {
+        // Update the transmission passthrough for position, velocity, and effort
+        actuator_interface.transmission_passthrough_position_ = actuator_interface.state_position_;
+        actuator_interface.transmission_passthrough_velocity_ = actuator_interface.state_velocity_;
+        actuator_interface.transmission_passthrough_effort_ = actuator_interface.state_effort_;
+    });
+
+    // Transmission: actuator -> joint
+    std::for_each(transmissions_.begin(), transmissions_.end(), [](auto& transmission) {
+        transmission->actuator_to_joint();
+    });
+
+    // Joint: transmission -> state
+    std::for_each(joint_interfaces_.begin(), joint_interfaces_.end(), [](auto& joint_interface) {
+        // Update the joint state for position, velocity, and effort
+        joint_interface.state_position_ = joint_interface.transmission_passthrough_position_;
+        joint_interface.state_velocity_ = joint_interface.transmission_passthrough_velocity_;
+        joint_interface.state_effort_ = joint_interface.transmission_passthrough_effort_;
+    });
+
     return return_type::OK;
 }
 
 return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Duration&) {
+    // Joint: command -> transmission
+    std::for_each(joint_interfaces_.begin(), joint_interfaces_.end(), [](auto& joint_interface) {
+        // Update transmission passthrough for position, velocity, and effort
+        joint_interface.transmission_passthrough_position_ = joint_interface.command_position_;
+        joint_interface.transmission_passthrough_velocity_ = joint_interface.command_velocity_;
+        joint_interface.transmission_passthrough_effort_ = joint_interface.command_effort_;
+    });
+
+    // Transmission: joint -> actuator
+    std::for_each(transmissions_.begin(), transmissions_.end(), [](auto& transmission) {
+        transmission->joint_to_actuator();
+    });
+
+    // Actuator: transmission -> command
+    std::for_each(actuator_interfaces_.begin(), actuator_interfaces_.end(), [](auto& actuator_interface) {
+        // Update command values for position, velocity, and effort
+        actuator_interface.command_position_ = actuator_interface.transmission_passthrough_position_;
+        actuator_interface.command_velocity_ = actuator_interface.transmission_passthrough_velocity_;
+        actuator_interface.command_effort_ = actuator_interface.transmission_passthrough_effort_;
+    });
+
+    for (size_t i = 0; i < info_.joints.size(); i++) {
+        axes_[i].pos_setpoint_ = actuator_interfaces_[i].command_position_;
+        axes_[i].vel_setpoint_ = actuator_interfaces_[i].command_velocity_;
+        axes_[i].torque_setpoint_ = actuator_interfaces_[i].command_effort_;
+    }
+
     for (auto& axis : axes_) {
         // Send the CAN message that fits the set of enabled setpoints
         if (axis.pos_input_enabled_) {
             Set_Input_Pos_msg_t msg;
             msg.Input_Pos = axis.pos_setpoint_ / (2 * M_PI);
-            msg.Vel_FF = axis.vel_input_enabled_ ? (axis.vel_setpoint_  / (2 * M_PI)) : 0.0f;
+            msg.Vel_FF = axis.vel_input_enabled_ ? (axis.vel_setpoint_ / (2 * M_PI)) : 0.0f;
             msg.Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
             axis.send(msg);
         } else if (axis.vel_input_enabled_) {

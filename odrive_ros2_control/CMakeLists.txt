@@ -9,6 +9,8 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(ament_cmake_auto REQUIRED)
+find_package(transmission_interface REQUIRED)
+
 ament_auto_find_build_dependencies()
 
 ament_export_dependencies(rosidl_default_runtime)
