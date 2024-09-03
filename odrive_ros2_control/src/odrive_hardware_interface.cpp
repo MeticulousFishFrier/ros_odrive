@@ -525,8 +525,8 @@ return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const r
     for (size_t i = 0; i < info_.joints.size(); i++) {
         actuator_interfaces_[i].state_position_ = axes_[i].pos_estimate_;
         actuator_interfaces_[i].state_velocity_ = axes_[i].vel_estimate_;
-        // BUG? state interface of odrive original code shows torque_target_ instead
-        actuator_interfaces_[i].state_effort_ = axes_[i].torque_estimate_;
+        // BUG? state interface of odrive original code shows torque_target_ instead of torque_estimate
+        actuator_interfaces_[i].state_effort_ = axes_[i].torque_target_;
     }
 
     // Actuator: state -> transmission
@@ -582,6 +582,11 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
     }
 
     for (auto& axis : axes_) {
+        // Log the pos_setpoint_, vel_input_enabled_, and torque_setpoint_
+        RCLCPP_INFO(*logger_, "Axis pos_setpoint_: %f", axis.pos_setpoint_);
+        RCLCPP_INFO(*logger_, "Axis vel_input_enabled_: %f", axis.vel_setpoint_);
+        RCLCPP_INFO(*logger_, "Axis torque_setpoint_: %f", axis.torque_setpoint_);
+
         // Send the CAN message that fits the set of enabled setpoints
         if (axis.pos_input_enabled_) {
             Set_Input_Pos_msg_t msg;
@@ -589,15 +594,20 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
             msg.Vel_FF = axis.vel_input_enabled_ ? (axis.vel_setpoint_ / (2 * M_PI)) : 0.0f;
             msg.Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
             axis.send(msg);
+            RCLCPP_INFO(*logger_, "Pos mode ");
         } else if (axis.vel_input_enabled_) {
             Set_Input_Vel_msg_t msg;
             msg.Input_Vel = axis.vel_setpoint_ / (2 * M_PI);
             msg.Input_Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
             axis.send(msg);
+            RCLCPP_INFO(*logger_, "Vel mode ");
+
         } else if (axis.torque_input_enabled_) {
             Set_Input_Torque_msg_t msg;
             msg.Input_Torque = axis.torque_setpoint_;
             axis.send(msg);
+            RCLCPP_INFO(*logger_, "Troque mode ");
+
         } else {
             // no control enabled - don't send any setpoint
         }
